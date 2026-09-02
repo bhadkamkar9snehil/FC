@@ -7,6 +7,7 @@ public partial class App : Application
     private readonly CancellationTokenSource _lifetime = new();
     private PeerApiHost? _apiHost;
     private SyncEngine? _sync;
+    private LanDiscoveryService? _discovery;
     private TrayIconService? _tray;
     public bool IsExiting { get; private set; }
 
@@ -26,9 +27,12 @@ public partial class App : Application
             var startup = new StartupService(store);
             _apiHost = new PeerApiHost(store, pairing, manifest);
             _sync = new SyncEngine(store, manifest, peerClient);
+            _discovery = new LanDiscoveryService(store);
+            _discovery.PeerAddressChanged += (_, _) => _sync.Signal();
 
             await _apiHost.StartAsync(certificate, _lifetime.Token);
             _sync.Start(_lifetime.Token);
+            _discovery.Start(_lifetime.Token);
 
             var window = new MainWindow(store, pairing, peerClient, sharing, _sync, startup);
             MainWindow = window;
@@ -65,6 +69,7 @@ public partial class App : Application
     {
         IsExiting = true;
         _lifetime.Cancel();
+        _discovery?.Dispose();
         try { _apiHost?.StopAsync().GetAwaiter().GetResult(); } catch { }
         _sync?.Dispose();
         _tray?.Dispose();

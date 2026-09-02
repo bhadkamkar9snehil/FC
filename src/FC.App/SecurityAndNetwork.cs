@@ -38,17 +38,32 @@ public sealed class CertificateService(StateStore store)
 
 public static class LanAddressService
 {
-    public static string GetBestLanAddress()
-    {
-        var candidates = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
-            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
-            .Select(u => u.Address)
-            .Where(a => a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a) && !a.ToString().StartsWith("169.254."))
-            .ToList();
+    public static string GetBestLanAddress() => GetCandidateAddresses().FirstOrDefault() ?? "127.0.0.1";
 
-        var preferred = candidates.FirstOrDefault(IsPrivateIpv4) ?? candidates.FirstOrDefault();
-        return preferred?.ToString() ?? "127.0.0.1";
+    public static IReadOnlyList<string> GetCandidateAddresses()
+    {
+        var rows = new List<(string Address, int Score)>();
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus != OperationalStatus.Up || nic.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
+                continue;
+            IPInterfaceProperties properties;
+            try { properties = nic.GetIPProperties(); } catch { continue; }
+            var hasGateway = properties.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any));
+            var physical = nic.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Wireless80211;
+            foreach (var unicast in properties.UnicastAddresses)
+            {
+                var address = unicast.Address;
+                if (address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address) || address.ToString().StartsWith("169.254."))
+                    continue;
+                var score = 0;
+                if (physical) score += 100;
+                if (hasGateway) score += 50;
+                if (IsPrivateIpv4(address)) score += 25;
+                rows.Add((address.ToString(), score));
+            }
+        }
+        return rows.OrderByDescending(r => r.Score).Select(r => r.Address).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     private static bool IsPrivateIpv4(IPAddress address)

@@ -2,10 +2,10 @@
 
 ## Transport
 
-- HTTPS over TCP.
-- Default port: `45832`.
+- HTTPS over TCP `45832` for synchronization.
+- UDP `45833` for LAN rediscovery of already-paired devices.
 - Kestrel listens on all local interfaces.
-- Recommended Windows Firewall rule is limited to `LocalSubnet` and Private/Domain profiles.
+- Recommended Windows Firewall rules are limited to `LocalSubnet` and Private/Domain profiles.
 
 ## Device identity
 
@@ -56,7 +56,28 @@ The receiver maps that key to a paired device before allowing folder manifest/fi
 
 TLS certificate pinning is performed by the caller on every peer connection.
 
-## Main endpoints
+## LAN rediscovery
+
+Every running FC instance broadcasts a small UDP announcement on port `45833` approximately every 10 seconds:
+
+```text
+protocol version
+device ID
+device name
+HTTPS sync port
+TLS certificate fingerprint
+```
+
+The persistent access key and folder information are **not** broadcast.
+
+An announcement can update a stored peer IP address only when:
+
+1. the device ID already belongs to a paired peer; and
+2. the announced TLS fingerprint matches the certificate fingerprint stored during pairing.
+
+This allows FC to recover automatically after DHCP changes a laptop's IPv4 address without turning discovery into an authentication mechanism.
+
+## Main HTTPS endpoints
 
 ### `GET /api/health`
 
@@ -81,6 +102,29 @@ Returns the local per-file state records for the folder.
 Authenticated. The calling device must have folder access. Path traversal is rejected by canonical root checking.
 
 Streams the current file bytes.
+
+## Synchronization state
+
+A manifest entry carries:
+
+```text
+folder ID
+relative path
+file length
+UTC last-write time
+SHA-256 content hash
+deleted flag
+version vector
+last updating device ID
+```
+
+A missing physical file with a persisted `deleted=true` entry is a tombstone. It is therefore distinct from a path that has never existed.
+
+Vector comparison determines whether local or remote state dominates or whether both sides changed concurrently.
+
+## File transfer
+
+Files are streamed to a sibling temporary path and SHA-256 verified before replacement of the destination path. Temporary FC partial files are excluded from manifests.
 
 ## Trust model
 

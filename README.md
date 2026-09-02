@@ -11,6 +11,7 @@ Two teammates install the same application, pair their computers once, select lo
 - One-time pairing invitations
 - TLS certificate fingerprint pinning
 - Per-device 256-bit access keys
+- UDP LAN rediscovery for already-paired devices after DHCP/IP changes
 - Folder sharing and acceptance workflow
 - Different local paths on each computer
 - Two-way synchronization
@@ -69,7 +70,14 @@ Run PowerShell as Administrator:
 .\scripts\Allow-FC-Firewall.ps1
 ```
 
-The rule permits TCP port `45832` only from `LocalSubnet`, on Private/Domain firewall profiles.
+The script creates two LocalSubnet-only rules on Private/Domain firewall profiles:
+
+```text
+TCP 45832   peer synchronization
+UDP 45833   paired-device LAN rediscovery
+```
+
+The UDP discovery packet contains only the device ID/name, sync port and certificate fingerprint. It does not contain the persistent access key. Unknown devices are ignored.
 
 ### 2. Start FC
 
@@ -89,6 +97,8 @@ On laptop B:
 3. Pairing automatically registers both sides.
 
 The invitation expires after 10 minutes and pins the TLS certificate of the invited computer.
+
+After pairing, FC broadcasts a small LAN announcement every 10 seconds. If DHCP later changes a teammate's IP address, the stored endpoint is updated only when both the paired device ID and pinned certificate fingerprint match.
 
 ### 4. Share a folder
 
@@ -133,6 +143,24 @@ Normal deletions propagate to peers, but the receiving machine first moves the p
 The `.fc-recycle` directory itself is excluded from synchronization.
 
 If a peer sends more than 100 deletions and they represent more than 20% of the receiver's active tracked files, the folder is safety-paused. The UI exposes **Allow once** to approve that batch.
+
+## Reliability model
+
+FC deliberately uses more than one signal:
+
+```text
+FileSystemWatcher event
+        +
+forced hash for watcher-dirty paths
+        +
+30-second full tree reconciliation
+        +
+SHA-256 transfer verification
+        +
+10-second paired-device LAN rediscovery
+```
+
+Watcher events therefore make synchronization fast, but they are not the sole source of truth.
 
 ## Data location
 

@@ -5,6 +5,7 @@ namespace FC;
 public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerClient client) : IDisposable
 {
     private readonly SemaphoreSlim _wake = new(0, 1);
+    private readonly SemaphoreSlim _cycleGate = new(1, 1);
     private readonly ConcurrentDictionary<Guid, FileSystemWatcher> _watchers = new();
     private Task? _loop;
 
@@ -50,37 +51,46 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
 
     private async Task RunCycleAsync(CancellationToken ct)
     {
-        var snapshot = await store.GetSnapshotAsync();
-        RefreshWatchers(snapshot);
-        foreach (var folder in snapshot.Folders.Where(f => f.Enabled && Directory.Exists(f.LocalPath)))
+        await _cycleGate.WaitAsync(ct);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            if (folder.SafetyPaused) continue;
-            var localFiles = await manifest.ScanFolderAsync(folder);
-            var latest = await store.GetSnapshotAsync();
-            foreach (var peerId in folder.PeerDeviceIds.Distinct())
+            var snapshot = await store.GetSnapshotAsync();
+            RefreshWatchers(snapshot);
+            foreach (var folder in snapshot.Folders.Where(f => f.Enabled && Directory.Exists(f.LocalPath)))
             {
-                var peer = latest.Peers.FirstOrDefault(p => p.DeviceId == peerId);
-                if (peer is null) continue;
-                try
+                ct.ThrowIfCancellationRequested();
+                if (folder.SafetyPaused) continue;
+                var localFiles = await manifest.ScanFolderAsync(folder);
+                var latest = await store.GetSnapshotAsync();
+                foreach (var peerId in folder.PeerDeviceIds.Distinct())
                 {
-                    var remote = await client.GetManifestAsync(peer, folder.FolderId, ct);
-                    await SetPeerOnlineAsync(peer.DeviceId, true);
-                    if (!remote.Found)
+                    var peer = latest.Peers.FirstOrDefault(p => p.DeviceId == peerId);
+                    if (peer is null) continue;
+                    try
                     {
-                        await client.OfferFolderAsync(peer, folder, ct);
-                        continue;
+                        var remote = await client.GetManifestAsync(peer, folder.FolderId, ct);
+                        if (await SetPeerOnlineAsync(peer.DeviceId, true))
+                            await store.AddActivityAsync("Network", $"{peer.DeviceName} is online.");
+                        if (!remote.Found)
+                        {
+                            await client.OfferFolderAsync(peer, folder, ct);
+                            continue;
+                        }
+                        await ReconcileAsync(folder, peer, localFiles, remote.Files, ct);
+                        localFiles = await manifest.ScanFolderAsync(folder);
                     }
-                    await ReconcileAsync(folder, peer, localFiles, remote.Files, ct);
-                    localFiles = await manifest.ScanFolderAsync(folder);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch (Exception ex)
-                {
-                    await SetPeerOnlineAsync(peer.DeviceId, false);
-                    await store.AddActivityAsync("Network", $"{peer.DeviceName} unavailable: {ShortError(ex)}");
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        if (await SetPeerOnlineAsync(peer.DeviceId, false))
+                            await store.AddActivityAsync("Network", $"{peer.DeviceName} unavailable: {ShortError(ex)}");
+                    }
                 }
             }
+        }
+        finally
+        {
+            try { await store.FlushAsync(); } finally { _cycleGate.Release(); }
         }
     }
 
@@ -105,38 +115,66 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
             return;
         }
 
+        var received = 0;
+        var deleted = 0;
+        var conflicts = 0;
+        var adoptedTombstones = 0;
+        var errors = new List<string>();
+
         foreach (var path in local.Keys.Concat(remote.Keys).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x))
         {
             ct.ThrowIfCancellationRequested();
             local.TryGetValue(path, out var l);
             remote.TryGetValue(path, out var r);
             if (r is null) continue;
-            if (l is null)
+            try
             {
-                if (r.Deleted) await StoreFileStateAsync(r);
-                else await ApplyRemoteAsync(folder, peer, r, ct);
-                continue;
-            }
+                if (l is null)
+                {
+                    if (r.Deleted) { await StoreFileStateAsync(CloneForFolder(r, folder.FolderId)); adoptedTombstones++; }
+                    else { await ApplyRemoteAsync(folder, peer, r, ct); received++; }
+                    continue;
+                }
 
-            switch (VectorClock.Compare(l.Vector, r.Vector))
-            {
-                case VectorRelation.RemoteDominates:
-                    await ApplyRemoteAsync(folder, peer, r, ct);
-                    break;
-                case VectorRelation.Concurrent:
-                    if (l.Deleted && r.Deleted)
-                    {
-                        var merged = VectorClock.Increment(VectorClock.Merge(l.Vector, r.Vector), MinClockKey(l.UpdatedByDeviceId, r.UpdatedByDeviceId));
-                        l.Vector = merged;
-                        l.StateUtc = DateTime.UtcNow;
-                        await StoreFileStateAsync(l);
-                    }
-                    else
-                    {
-                        await ResolveConflictAsync(folder, peer, l, r, ct);
-                    }
-                    break;
+                switch (VectorClock.Compare(l.Vector, r.Vector))
+                {
+                    case VectorRelation.RemoteDominates:
+                        await ApplyRemoteAsync(folder, peer, r, ct);
+                        if (r.Deleted) deleted++; else received++;
+                        break;
+                    case VectorRelation.Concurrent:
+                        if (l.Deleted && r.Deleted)
+                        {
+                            var merged = VectorClock.Increment(VectorClock.Merge(l.Vector, r.Vector), MinClockKey(l.UpdatedByDeviceId, r.UpdatedByDeviceId));
+                            l.Vector = merged;
+                            l.StateUtc = DateTime.UtcNow;
+                            await StoreFileStateAsync(l);
+                            adoptedTombstones++;
+                        }
+                        else
+                        {
+                            await ResolveConflictAsync(folder, peer, l, r, ct);
+                            conflicts++;
+                        }
+                        break;
+                }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                if (errors.Count < 3) errors.Add($"{path}: {ShortError(ex)}");
+            }
+        }
+
+        if (received + deleted + conflicts + adoptedTombstones > 0 || errors.Count > 0)
+        {
+            var parts = new List<string>();
+            if (received > 0) parts.Add($"{received} received");
+            if (deleted > 0) parts.Add($"{deleted} deleted");
+            if (conflicts > 0) parts.Add($"{conflicts} conflict{(conflicts == 1 ? "" : "s")} preserved");
+            if (errors.Count > 0) parts.Add($"{errors.Count} error sample{(errors.Count == 1 ? "" : "s")}: {string.Join(" | ", errors)}");
+            if (parts.Count > 0)
+                await store.AddActivityAsync("Sync", $"{folder.Name} ↔ {peer.DeviceName}: {string.Join(", ", parts)}.");
         }
     }
 
@@ -146,18 +184,13 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
         if (full is null) return;
         if (remote.Deleted)
         {
-            try
+            if (File.Exists(full))
             {
-                if (File.Exists(full))
-                {
-                    var recycle = Path.Combine(folder.LocalPath, ".fc-recycle", DateTime.UtcNow.ToString("yyyyMMdd"), remote.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-                    Directory.CreateDirectory(Path.GetDirectoryName(recycle)!);
-                    File.Move(full, MakeUnique(recycle), false);
-                }
-                await StoreFileStateAsync(CloneForFolder(remote, folder.FolderId));
-                await store.AddActivityAsync("Delete", $"{folder.Name}: removed {remote.RelativePath} from {peer.DeviceName} (recycled locally).");
+                var recycle = Path.Combine(folder.LocalPath, ".fc-recycle", DateTime.UtcNow.ToString("yyyyMMdd"), remote.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(recycle)!);
+                File.Move(full, MakeUnique(recycle), false);
             }
-            catch (Exception ex) { await store.AddActivityAsync("Error", $"Could not apply deletion for {remote.RelativePath}: {ShortError(ex)}"); }
+            await StoreFileStateAsync(CloneForFolder(remote, folder.FolderId));
             return;
         }
 
@@ -172,7 +205,6 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
             File.Move(temp, full, true);
             File.SetLastWriteTimeUtc(full, remote.LastWriteUtc);
             await StoreFileStateAsync(CloneForFolder(remote, folder.FolderId));
-            await store.AddActivityAsync("Sync", $"{folder.Name}: received {remote.RelativePath} from {peer.DeviceName}.");
         }
         catch
         {
@@ -234,28 +266,29 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
             conflictState.StateUtc = DateTime.UtcNow;
             await StoreFileStateAsync(conflictState);
         }
-        await store.AddActivityAsync("Conflict", $"{folder.Name}: preserved both versions of {local.RelativePath}; conflict copy is {conflictRel}.");
     }
 
     private Task StoreFileStateAsync(FileVersionState file) => store.MutateAsync(s =>
     {
         s.Files.RemoveAll(f => f.FolderId == file.FolderId && string.Equals(f.RelativePath, file.RelativePath, StringComparison.OrdinalIgnoreCase));
         s.Files.Add(file);
-    }, notify: false);
+    }, notify: false, persist: false);
 
-    private async Task SetPeerOnlineAsync(Guid peerId, bool online)
+    private async Task<bool> SetPeerOnlineAsync(Guid peerId, bool online)
     {
         var snapshot = await store.GetSnapshotAsync();
         var peer = snapshot.Peers.FirstOrDefault(p => p.DeviceId == peerId);
-        if (peer is null) return;
+        if (peer is null) return false;
+        var statusChanged = peer.IsOnline != online;
         var refreshSeen = online && (peer.LastSeenUtc is null || DateTime.UtcNow - peer.LastSeenUtc > TimeSpan.FromSeconds(30));
-        if (peer.IsOnline == online && !refreshSeen) return;
+        if (!statusChanged && !refreshSeen) return false;
         await store.MutateAsync(s =>
         {
             var p = s.Peers.First(x => x.DeviceId == peerId);
             p.IsOnline = online;
             if (online) p.LastSeenUtc = DateTime.UtcNow;
         });
+        return statusChanged;
     }
 
     private void RefreshWatchers(AppState state)
@@ -275,8 +308,13 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
                     InternalBufferSize = 64 * 1024,
                     EnableRaisingEvents = true
                 };
-                FileSystemEventHandler signal = (_, _) => Signal();
-                RenamedEventHandler renamed = (_, _) => Signal();
+                FileSystemEventHandler signal = (_, e) => { manifest.MarkDirty(folder.FolderId, folder.LocalPath, e.FullPath); Signal(); };
+                RenamedEventHandler renamed = (_, e) =>
+                {
+                    manifest.MarkDirty(folder.FolderId, folder.LocalPath, e.OldFullPath);
+                    manifest.MarkDirty(folder.FolderId, folder.LocalPath, e.FullPath);
+                    Signal();
+                };
                 ErrorEventHandler error = (_, _) => Signal();
                 watcher.Changed += signal; watcher.Created += signal; watcher.Deleted += signal; watcher.Renamed += renamed; watcher.Error += error;
                 _watchers[folder.FolderId] = watcher;
@@ -331,5 +369,6 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
         foreach (var watcher in _watchers.Values) watcher.Dispose();
         _watchers.Clear();
         _wake.Dispose();
+        _cycleGate.Dispose();
     }
 }

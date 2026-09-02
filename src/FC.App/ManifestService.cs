@@ -1,10 +1,34 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 
 namespace FC;
 
 public sealed class ManifestService(StateStore store)
 {
+    private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _scanGates = new();
+    private readonly ConcurrentDictionary<Guid, ConcurrentDictionary<string, byte>> _dirtyPaths = new();
+
+    public void MarkDirty(Guid folderId, string rootPath, string fullPath)
+    {
+        try
+        {
+            var relative = Normalize(Path.GetRelativePath(rootPath, fullPath));
+            if (relative.Length == 0) return;
+            var set = _dirtyPaths.GetOrAdd(folderId, _ => new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase));
+            set[relative] = 0;
+        }
+        catch { }
+    }
+
     public async Task<List<FileVersionState>> ScanFolderAsync(SyncFolder folder)
+    {
+        var gate = _scanGates.GetOrAdd(folder.FolderId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync();
+        try { return await ScanFolderCoreAsync(folder); }
+        finally { gate.Release(); }
+    }
+
+    private async Task<List<FileVersionState>> ScanFolderCoreAsync(SyncFolder folder)
     {
         if (!Directory.Exists(folder.LocalPath)) return [];
         var snapshot = await store.GetSnapshotAsync();
@@ -12,8 +36,16 @@ public sealed class ManifestService(StateStore store)
         var known = snapshot.Files.Where(f => f.FolderId == folder.FolderId)
             .ToDictionary(f => f.RelativePath, StringComparer.OrdinalIgnoreCase);
         var observed = new Dictionary<string, FileVersionState>(StringComparer.OrdinalIgnoreCase);
+        var dirty = _dirtyPaths.GetOrAdd(folder.FolderId, _ => new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase));
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+            ReturnSpecialDirectories = false
+        };
 
-        foreach (var fullPath in Directory.EnumerateFiles(folder.LocalPath, "*", SearchOption.AllDirectories))
+        foreach (var fullPath in Directory.EnumerateFiles(folder.LocalPath, "*", options))
         {
             var relative = Normalize(Path.GetRelativePath(folder.LocalPath, fullPath));
             if (ShouldIgnore(relative)) continue;
@@ -21,7 +53,8 @@ public sealed class ManifestService(StateStore store)
             {
                 var info = new FileInfo(fullPath);
                 known.TryGetValue(relative, out var old);
-                var metadataMatches = old is not null && !old.Deleted && old.Length == info.Length && Math.Abs((old.LastWriteUtc - info.LastWriteTimeUtc).TotalMilliseconds) < 2;
+                var forceHash = dirty.ContainsKey(relative);
+                var metadataMatches = !forceHash && old is not null && !old.Deleted && old.Length == info.Length && Math.Abs((old.LastWriteUtc - info.LastWriteTimeUtc).TotalMilliseconds) < 2;
                 var hash = metadataMatches ? old!.Hash : ComputeHash(fullPath);
                 if (old is not null && !old.Deleted && string.Equals(old.Hash, hash, StringComparison.OrdinalIgnoreCase))
                 {
@@ -44,6 +77,7 @@ public sealed class ManifestService(StateStore store)
                         StateUtc = DateTime.UtcNow
                     };
                 }
+                dirty.TryRemove(relative, out _);
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
@@ -66,6 +100,7 @@ public sealed class ManifestService(StateStore store)
             };
         }
 
+        dirty.Clear();
         await store.MutateAsync(s =>
         {
             s.Files.RemoveAll(f => f.FolderId == folder.FolderId);

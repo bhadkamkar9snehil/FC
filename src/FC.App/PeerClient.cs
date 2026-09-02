@@ -41,12 +41,16 @@ public sealed class PeerClient(StateStore store)
         return new(true, files);
     }
 
-    public async Task<byte[]> DownloadFileAsync(PeerDevice peer, Guid folderId, string relativePath, CancellationToken ct)
+    public async Task DownloadFileToAsync(PeerDevice peer, Guid folderId, string relativePath, string destinationPath, CancellationToken ct)
     {
         var local = await store.GetSnapshotAsync();
         using var client = CreateClient(peer.Host, peer.Port, peer.CertificateThumbprint, local.Identity.AccessKey);
         var url = $"api/folders/{folderId:D}/file?path={Uri.EscapeDataString(relativePath)}";
-        return await client.GetByteArrayAsync(url, ct);
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+        await using var source = await response.Content.ReadAsStreamAsync(ct);
+        await using var destination = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await source.CopyToAsync(destination, 1024 * 1024, ct);
     }
 
     public async Task OfferFolderAsync(PeerDevice peer, SyncFolder folder, CancellationToken ct)
@@ -64,7 +68,7 @@ public sealed class PeerClient(StateStore store)
             ServerCertificateCustomValidationCallback = (_, cert, _, _) => cert is not null &&
                 string.Equals(CertificateService.NormalizeThumbprint(cert.GetCertHashString()), CertificateService.NormalizeThumbprint(expectedThumbprint), StringComparison.OrdinalIgnoreCase)
         };
-        var client = new HttpClient(handler) { BaseAddress = new Uri($"https://{host}:{port}/"), Timeout = TimeSpan.FromSeconds(20) };
+        var client = new HttpClient(handler) { BaseAddress = new Uri($"https://{host}:{port}/"), Timeout = TimeSpan.FromMinutes(10) };
         if (!string.IsNullOrWhiteSpace(accessKey)) client.DefaultRequestHeaders.Add("X-FC-Key", accessKey);
         return client;
     }

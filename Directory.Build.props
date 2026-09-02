@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Product>FC — LAN Folder Sync</Product>
+    <Description>Windows-first peer-to-peer LAN folder synchronization.</Description>
+  </PropertyGroup>
+</Project>

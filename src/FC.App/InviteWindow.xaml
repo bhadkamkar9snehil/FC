@@ -1,0 +1,13 @@
+<Window x:Class="FC.InviteWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Invite teammate" Width="620" Height="330" ResizeMode="NoResize" WindowStartupLocation="CenterOwner" Background="{StaticResource CanvasBrush}">
+    <Grid Margin="24">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <TextBlock Text="Invite a teammate" FontSize="21" FontWeight="SemiBold"/>
+        <TextBlock Grid.Row="1" Text="Send this one-time code to a teammate on the same office network. It expires in 10 minutes. The code has already been copied to your clipboard." TextWrapping="Wrap" Foreground="{StaticResource MutedBrush}" Margin="0,8,0,14"/>
+        <TextBox x:Name="InviteCodeBox" Grid.Row="2" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Padding="12" FontFamily="Consolas" FontSize="11"/>
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button Content="Copy again" Style="{StaticResource SecondaryButton}" Margin="0,0,8,0" Click="Copy_Click"/>
+            <Button Content="Done" Style="{StaticResource PrimaryButton}" IsDefault="True" Click="Done_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

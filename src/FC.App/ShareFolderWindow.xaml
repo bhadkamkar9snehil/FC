@@ -1,0 +1,13 @@
+<Window x:Class="FC.ShareFolderWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Share folder" Width="460" Height="270" ResizeMode="NoResize" WindowStartupLocation="CenterOwner" Background="{StaticResource CanvasBrush}">
+    <Grid Margin="24">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <TextBlock Text="Share with teammate" FontSize="21" FontWeight="SemiBold"/>
+        <TextBlock Grid.Row="1" Text="Choose a paired device. The teammate will be asked where to store the folder locally." TextWrapping="Wrap" Foreground="{StaticResource MutedBrush}" Margin="0,8,0,14"/>
+        <ComboBox x:Name="PeerCombo" Grid.Row="2" DisplayMemberPath="Label" SelectedValuePath="Id" Padding="8"/>
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button Content="Cancel" Style="{StaticResource SecondaryButton}" Margin="0,0,8,0" IsCancel="True"/>
+            <Button Content="Share" Style="{StaticResource PrimaryButton}" IsDefault="True" Click="Share_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

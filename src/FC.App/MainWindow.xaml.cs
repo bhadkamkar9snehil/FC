@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Windows;
+using System.Windows.Input;
 using Microsoft.Win32;
 
 namespace FC;
@@ -106,7 +107,7 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog() != true || string.IsNullOrWhiteSpace(dialog.InviteCode)) return;
         try
         {
-            Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            Mouse.OverrideCursor = Cursors.Wait;
             await _peerClient.PairAsync(dialog.InviteCode);
             _sync.Signal();
         }
@@ -179,7 +180,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            Mouse.OverrideCursor = Cursors.Wait;
             await _sync.SyncNowAsync();
         }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "Sync failed", MessageBoxButton.OK, MessageBoxImage.Error); }

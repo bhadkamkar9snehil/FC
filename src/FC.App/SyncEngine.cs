@@ -15,10 +15,7 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
         try { if (_wake.CurrentCount == 0) _wake.Release(); } catch (ObjectDisposedException) { }
     }
 
-    public async Task SyncNowAsync(CancellationToken ct = default)
-    {
-        await RunCycleAsync(ct);
-    }
+    public Task SyncNowAsync(CancellationToken ct = default) => RunCycleAsync(ct);
 
     public async Task AllowLargeDeleteOnceAsync(Guid folderId)
     {
@@ -44,10 +41,8 @@ public sealed class SyncEngine(StateStore store, ManifestService manifest, PeerC
 
             try
             {
-                var wait = _wake.WaitAsync(ct);
-                var periodic = Task.Delay(TimeSpan.FromSeconds(30), ct);
-                await Task.WhenAny(wait, periodic);
-                if (wait.IsCompletedSuccessfully) await Task.Delay(650, ct);
+                var signaled = await _wake.WaitAsync(TimeSpan.FromSeconds(30), ct);
+                if (signaled) await Task.Delay(650, ct);
             }
             catch (OperationCanceledException) { break; }
         }
